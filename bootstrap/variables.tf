@@ -5,7 +5,7 @@ variable "region" {
 }
 
 variable "github_repo" {
-  description = "The GitHub repository allowed to assume the CI roles"
+  description = "GitHub repository allowed to assume the CI roles, in the immutable OIDC subject form owner@owner_id/repo@repo_id (see: gh api repos/OWNER/REPO/actions/oidc/customization/sub)"
   type        = string
-  default     = "RonanCraig/platform-starter-kit"
+  default     = "RonanCraig@28508859/platform-starter-kit@1469237086"
 }
