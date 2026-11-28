@@ -1,4 +1,5 @@
 resource "aws_vpc" "this" {
+  # checkov:skip=CKV2_AWS_11:Flow logs bill CloudWatch ingestion; planned as an optional enable_flow_logs variable
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -8,6 +9,7 @@ resource "aws_vpc" "this" {
 }
 
 data "aws_availability_zones" "available" {
+  # checkov:skip=CKV_AWS_394:slice() below takes the first az_count zones, so a newly added AZ doesn't change the result
   state = "available"
 }
 
@@ -21,7 +23,7 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.this.id
   cidr_block              = cidrsubnet(var.vpc_cidr, 8, each.value + 1)
   availability_zone       = each.key
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = true # checkov:skip=CKV_AWS_130:Public subnets assign public IPs by design
   tags = {
     Name = "${var.name}-public-${each.value + 1}"
   }
@@ -34,6 +36,15 @@ resource "aws_subnet" "private" {
   availability_zone = each.key
   tags = {
     Name = "${var.name}-private-${each.value + 1}"
+  }
+}
+
+# Takes over the VPC's default security group and removes all its rules,
+# so anything accidentally launched without a security group gets no traffic.
+resource "aws_default_security_group" "this" {
+  vpc_id = aws_vpc.this.id
+  tags = {
+    Name = "${var.name}-default-sg-locked"
   }
 }
 
