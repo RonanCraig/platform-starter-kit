@@ -6,4 +6,12 @@ terraform {
       version = "~> 6.0"
     }
   }
+
+  backend "s3" {
+    bucket       = "psk-tfstate-535515637778-eu-west-2"
+    key          = "examples/web-service/terraform.tfstate"
+    region       = "eu-west-2"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
