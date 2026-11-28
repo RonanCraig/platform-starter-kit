@@ -1,134 +1,142 @@
 # platform-starter-kit
 
-Reusable Terraform modules for building production-style AWS infrastructure — networking, compute, database and CI — following the practices platform teams use: least privilege, no long-lived credentials, security scanning and remote state.
+Reusable Terraform modules for a production-style, three-tier AWS platform (network, load-balanced compute and a PostgreSQL database), delivered through a CI (Continuous Integration) pipeline with no long-lived credentials, security scanning on every pull request, and remote state with locking.
+
+[![terraform](https://github.com/RonanCraig/platform-starter-kit/actions/workflows/terraform.yml/badge.svg)](https://github.com/RonanCraig/platform-starter-kit/actions/workflows/terraform.yml)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    user([Internet]) -->|HTTP 80| alb
+
+    subgraph vpc [VPC, 2 Availability Zones]
+        subgraph public [Public subnets]
+            alb[Application Load Balancer]
+        end
+        subgraph private [Private subnets]
+            asg[Auto Scaling group<br/>EC2, Amazon Linux 2023]
+            rds[(RDS PostgreSQL<br/>encrypted, private)]
+        end
+    end
+
+    alb -->|app port, ALB SG only| asg
+    asg -->|5432, app SG only| rds
+    rds -.->|master password,<br/>generated and rotated| sm[Secrets Manager]
+```
+
+Each tier only accepts traffic from the security group in front of it. Nothing in the private subnets has a public IP, and the database password never appears in code or Terraform state.
+
+```mermaid
+flowchart LR
+    pr[Pull request] --> gha[GitHub Actions]
+    gha -->|signed OIDC token| sts[AWS STS]
+    sts -->|temporary credentials, ~1 h| role[Read-only plan role]
+    role --> plan[terraform plan]
+    plan <-->|state + lock| s3[(S3 state bucket)]
+```
+
+## What this demonstrates
+
+- **Modular IaC (Infrastructure as Code):** small, single-purpose modules (`vpc`, `service`, `database`) composed in root modules under `examples/`, with typed and documented inputs and outputs.
+- **Keyless CI:** GitHub Actions authenticates to AWS through OIDC (OpenID Connect) federation. The trust policy is pinned to this repository's immutable subject claim, and the role is read-only.
+- **Gated changes:** `main` is protected. Every change needs a pull request with four passing checks: `fmt`, `security` (Checkov) and a `plan` for each example.
+- **Security scanning with triage:** every Checkov finding is either fixed or skipped with a written justification next to the code. There are no blanket suppressions.
+- **Remote state:** a versioned, encrypted, private S3 bucket with S3-native locking and one state file per root module, created by a separate `bootstrap/` configuration.
+- **Secure defaults:** IMDSv2 required, encryption at rest, the VPC's default security group locked down, database deletion protection on by default, and secrets managed by AWS rather than by Terraform.
+- **Cost awareness:** the NAT gateway is optional, the defaults are small instance classes, Multi-AZ is opt-in, and old state versions expire.
 
 ## Modules
 
-| Module | Status | What it builds |
-|---|---|---|
-| [`vpc`](modules/vpc) | ✅ Available | A VPC (Virtual Private Cloud) across 2–3 AZs (Availability Zones) with public and private subnets, an internet gateway, route tables, and an optional NAT (Network Address Translation) gateway |
-| [`service`](modules/service) | ✅ Available | An internet-facing ALB (Application Load Balancer) in public subnets, plus an Auto Scaling group of EC2 (Elastic Compute Cloud) instances in private subnets with a launch template, ELB (Elastic Load Balancing) health checks and CPU (Central Processing Unit) target-tracking scaling |
-| `database` | Planned | RDS (Relational Database Service) PostgreSQL in private subnets, encrypted, optionally Multi-AZ, with the password kept in Secrets Manager |
-| CI wiring | Planned | GitHub Actions running fmt/validate, a security scan, plan on every PR (pull request), and apply with approval, authenticated with OIDC (OpenID Connect) |
+| Module | What it builds |
+|---|---|
+| [`vpc`](modules/vpc) | VPC (Virtual Private Cloud) across 2–3 Availability Zones with public and private subnets, an internet gateway, route tables, a locked-down default security group and an optional NAT (Network Address Translation) gateway |
+| [`service`](modules/service) | Internet-facing ALB (Application Load Balancer) plus an Auto Scaling group of EC2 instances in private subnets, with ELB health checks and CPU target-tracking scaling |
+| [`database`](modules/database) | RDS (Relational Database Service) PostgreSQL in private subnets: encrypted, IAM authentication, Performance Insights, logs exported to CloudWatch, optional Multi-AZ, with the master password generated and rotated in Secrets Manager |
+
+Each module's README lists its inputs and outputs.
 
 ## Repository layout
 
 ```
+bootstrap/          # one-off root: S3 state bucket + GitHub OIDC provider and CI plan role (local state)
 modules/
-  vpc/              # reusable module: no provider config, minimum provider version only
-  service/          # ALB + Auto Scaling group, takes VPC outputs as inputs
+  vpc/
+  service/
+  database/
 examples/
-  basic/            # root module showing minimal usage; provider config and pinned versions live here
-  web-service/      # root module wiring vpc -> service into a working load-balanced web tier
+  basic/            # vpc only
+  web-service/      # vpc -> service -> database: the full three-tier stack
+.github/workflows/
+  terraform.yml     # fmt, Checkov, plan per example on every pull request
 ```
 
-## Usage
+## Getting started
 
-```hcl
-module "vpc" {
-  source = "../../modules/vpc"
+### 1. Bootstrap (once per AWS account)
 
-  name               = "starter-dev"
-  vpc_cidr           = "10.0.0.0/16"
-  az_count           = 2
-  enable_nat_gateway = false # NAT gateways are billed hourly; enable only when private subnets need outbound internet access
-}
-```
-
-Subnet CIDRs are derived from `vpc_cidr` with `cidrsubnet()`: public subnets get `10.0.1.0/24`, `10.0.2.0/24`, …; private subnets get `10.0.11.0/24`, `10.0.12.0/24`, …. AZs are looked up from the Region rather than hard-coded.
-
-To try the example:
+`bootstrap/` creates the S3 state bucket and the GitHub OIDC trust. It keeps its own state locally, because the bucket can't store the state of the configuration that creates it.
 
 ```bash
-cd examples/basic
+cd bootstrap
 terraform init
-terraform plan                                  # NAT gateway off
-terraform plan -var enable_nat_gateway=true     # NAT gateway on
+terraform apply
+terraform output state_bucket_name
 ```
 
-### `vpc` inputs
+If you fork this repo, set `github_repo` to your repository's OIDC subject prefix:
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `name` | string | — (required) | Prefix for resource `Name` tags |
-| `vpc_cidr` | string | `10.0.0.0/16` | CIDR block for the VPC |
-| `az_count` | number | `2` | Number of AZs to use (2–3) |
-| `enable_nat_gateway` | bool | `false` | Create a single NAT gateway and a default route for the private subnets |
-
-### `vpc` outputs
-
-| Name | Description |
-|---|---|
-| `vpc_id` | ID of the VPC |
-| `public_subnet_ids` | IDs of the public subnets |
-| `private_subnet_ids` | IDs of the private subnets |
-| `nat_gateway_id` | ID of the NAT gateway, or `null` when disabled |
-
-### `service` usage
-
-```hcl
-module "service" {
-  source = "../../modules/service"
-
-  name               = "starter-dev"
-  vpc_id             = module.vpc.vpc_id
-  public_subnet_ids  = module.vpc.public_subnet_ids
-  private_subnet_ids = module.vpc.private_subnet_ids
-}
+```bash
+gh api repos/OWNER/REPO/actions/oidc/customization/sub
 ```
 
-Traffic flows internet → ALB (public subnets, port 80) → instances (private subnets, `app_port`). The instance security group only accepts traffic from the ALB security group, so instances have no public exposure. Instances use the latest Amazon Linux 2023 AMI (Amazon Machine Image), looked up from SSM (Systems Manager) Parameter Store, require IMDSv2 (Instance Metadata Service version 2), and serve a static page with Python's built-in HTTP (Hypertext Transfer Protocol) server, so no NAT gateway is needed.
+### 2. Point the examples at your bucket
 
-The Auto Scaling group uses `health_check_type = "ELB"`, so instances failing the ALB health check are replaced, and a target-tracking policy holds average CPU at 50%. `desired_capacity` is only used at creation (`ignore_changes`), so `terraform apply` never undoes a scale-out.
+Each example's `versions.tf` has a `backend "s3"` block. Replace `bucket` with your bucket name. Backend blocks can't use variables, because they're read before anything else is evaluated.
 
-To try it:
+### 3. Run an example
 
 ```bash
 cd examples/web-service
 terraform init
 terraform apply
-curl "http://$(terraform output -raw alb_dns_name)"   # may take a few minutes while instances pass health checks
+curl "http://$(terraform output -raw alb_dns_name)"   # allow a few minutes for health checks
 terraform destroy
 ```
 
-### `service` inputs
+`examples/web-service` creates billable resources (the ALB, EC2 instances and RDS are billed hourly). Destroy it when you've finished.
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `name` | string | — (required) | Prefix for resource names and `Name` tags |
-| `vpc_id` | string | — (required) | ID of the VPC to deploy into |
-| `public_subnet_ids` | list(string) | — (required) | Subnets for the ALB |
-| `private_subnet_ids` | list(string) | — (required) | Subnets for the instances |
-| `instance_type` | string | `t3.micro` | EC2 instance type |
-| `min_size` | number | `2` | Minimum instances in the Auto Scaling group |
-| `max_size` | number | `4` | Maximum instances in the Auto Scaling group |
-| `desired_capacity` | number | `2` | Initial instance count; scaling policies manage it after creation |
-| `app_port` | number | `80` | Port the application listens on |
+## CI pipeline
 
-### `service` outputs
+[`terraform.yml`](.github/workflows/terraform.yml) runs on every pull request to `main`:
 
-| Name | Description |
-|---|---|
-| `alb_dns_name` | DNS (Domain Name System) name of the ALB |
-| `asg_name` | Name of the Auto Scaling group |
-| `target_group_arn` | ARN (Amazon Resource Name) of the target group |
-| `alb_security_group_id` | ID of the ALB security group |
-| `instance_security_group_id` | ID of the instance security group |
+| Job | What it does | AWS access |
+|---|---|---|
+| `fmt` | `terraform fmt -check -recursive` | none |
+| `security` | Checkov scan of all Terraform (pinned version, run with `pipx`, no third-party action) | none |
+| `plan (examples/basic)` / `plan (examples/web-service)` | `init`, `validate`, `plan`, as a matrix job per root | read-only role via OIDC |
 
-## Principles
+The plan role has `ReadOnlyAccess`, plus read access to state and write access only to `*.tflock` objects, so CI can lock state but never overwrite it.
 
-- No hard-coded account IDs or Regions.
-- No long-lived credentials.
-- State is never committed.
-- Least privilege and encryption by default.
-- Every module has typed variables with descriptions, outputs, and a working example in `examples/`.
-- Checked in CI: formatting, validation and a security scan (e.g. Checkov or Trivy) on every PR.
-- Pinned versions.
-- Cost-aware.
+## Security decisions
+
+Checkov runs on every pull request. Findings that don't apply to a demo environment are skipped **inline, with the reason**, for example:
+
+```hcl
+# checkov:skip=CKV_AWS_2:No domain or ACM certificate in this demo; HTTPS is a documented follow-up
+```
+
+Search the repo for `checkov:skip` to see every accepted risk and why it was accepted.
 
 ## Requirements
 
-- Terraform >= 1.10
-- AWS provider `~> 6.0` (pinned in each example)
-- An AWS account, with credentials supplied by the standard AWS credential provider chain (e.g. `aws login`) — no access keys in code
-- Applying the examples creates billable resources (notably the optional NAT gateway and the ALB, both billed hourly); run `terraform destroy` when finished
+- Terraform >= 1.10 (CI uses 1.17.2)
+- AWS provider `~> 6.0`, pinned in each root module
+- AWS credentials from the standard credential provider chain (e.g. `aws login`); no access keys in code
+
+## Roadmap
+
+- HTTPS on the ALB (Route 53 domain + ACM certificate)
+- Apply job using a separate write role, trusted only for a protected `production` environment with manual approval
+- Plan output posted as a pull request comment
+- Optional VPC flow logs
