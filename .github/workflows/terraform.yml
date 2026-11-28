@@ -26,6 +26,18 @@ jobs:
       - name: terraform fmt
         run: terraform fmt -check -recursive
 
+  # Static security scan of all Terraform; no AWS credentials needed.
+  # Run via pipx (preinstalled on runners) rather than a third-party action to keep the supply chain small.
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Checkov
+        run: pipx run --spec checkov==3.4.11 checkov -d . --framework terraform --compact
+
   plan:
     name: plan (${{ matrix.dir }})
     runs-on: ubuntu-latest
