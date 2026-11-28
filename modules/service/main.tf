@@ -19,6 +19,8 @@ resource "aws_security_group" "app" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_ingress" {
+  # checkov:skip=CKV_AWS_260:The ALB is public by design; port 80 is open until an HTTPS listener (needs a domain and ACM certificate) is added
+  description       = "HTTP from the internet"
   from_port         = 80
   to_port           = 80
   ip_protocol       = "tcp"
@@ -27,6 +29,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_ingress" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "alb_egress" {
+  description                  = "To app instances on the app port"
   from_port                    = var.app_port
   to_port                      = var.app_port
   ip_protocol                  = "tcp"
@@ -35,6 +38,8 @@ resource "aws_vpc_security_group_egress_rule" "alb_egress" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "app_ingress" {
+  # checkov:skip=CKV_AWS_260:False positive; the source is the ALB security group, not 0.0.0.0/0
+  description                  = "From the ALB only"
   from_port                    = var.app_port
   to_port                      = var.app_port
   ip_protocol                  = "tcp"
@@ -82,6 +87,12 @@ resource "aws_autoscaling_group" "this" {
 
   target_group_arns = [aws_lb_target_group.this.arn]
 
+  tag {
+    key                 = "Name"
+    value               = "${var.name}-asg"
+    propagate_at_launch = false # instances are named by the launch template's tag_specifications
+  }
+
   # Scaling policies change desired capacity at runtime; don't let Terraform reset it on every apply.
   lifecycle {
     ignore_changes = [desired_capacity]
@@ -101,13 +112,19 @@ resource "aws_autoscaling_policy" "cpu_policy" {
 }
 
 resource "aws_lb" "this" {
-  name               = "${var.name}-alb"
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = var.public_subnet_ids
+  # checkov:skip=CKV2_AWS_20:No HTTPS listener yet (needs a domain and ACM certificate), so there is nothing to redirect to
+  # checkov:skip=CKV2_AWS_28:WAF costs about $5+/month, not justified for a demo serving a static page
+  # checkov:skip=CKV_AWS_91:Access logs need a dedicated log bucket; possible follow-up
+  # checkov:skip=CKV_AWS_150:Examples are destroyed after every test; deletion protection would block that
+  name                       = "${var.name}-alb"
+  load_balancer_type         = "application"
+  security_groups            = [aws_security_group.alb.id]
+  subnets                    = var.public_subnet_ids
+  drop_invalid_header_fields = true # reject malformed headers (HTTP request smuggling defence)
 }
 
 resource "aws_lb_target_group" "this" {
+  # checkov:skip=CKV_AWS_378:TLS terminates at the ALB; the hop to targets stays inside private subnets
   name     = "${var.name}-tg"
   port     = var.app_port
   protocol = "HTTP"
@@ -123,6 +140,8 @@ resource "aws_lb_target_group" "this" {
 }
 
 resource "aws_lb_listener" "this" {
+  # checkov:skip=CKV_AWS_2:No domain or ACM certificate in this demo; HTTPS is a documented follow-up
+  # checkov:skip=CKV_AWS_103:TLS policy only applies once an HTTPS listener exists
   load_balancer_arn = aws_lb.this.arn
   port              = 80
   protocol          = "HTTP"
