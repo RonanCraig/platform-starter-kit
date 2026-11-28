@@ -1,0 +1,64 @@
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+
+# Least privilege for the automatic GITHUB_TOKEN in every job.
+permissions:
+  contents: read # check out the repo
+  id-token: write # request an OIDC token to swap for AWS credentials
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.2
+
+      # Exits non-zero if any file needs formatting, failing the check.
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+  plan:
+    name: plan (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # let the other root finish if one fails
+      matrix:
+        dir:
+          - examples/basic
+          - examples/web-service
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.2
+
+      # Swaps the job's OIDC token for temporary credentials for the read-only plan role.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: eu-west-2
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        run: terraform plan -input=false -no-color
